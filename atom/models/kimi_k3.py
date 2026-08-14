@@ -8,6 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import os
 from typing import ClassVar
 
 import torch
@@ -18,6 +19,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from einops import rearrange
 from torch import nn
 
@@ -1173,23 +1175,68 @@ class KimiKDAAttention(nn.Module):
             # one kernel. is_kda + lower_bound select the per-K-channel,
             # lower-bounded sigmoid gate that Kimi-KDA uses (beta stays raw
             # logits; the kernel applies sigmoid in fp32 internally).
-            fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=gate,
-                b=beta,
-                dt_bias=self.dt_bias,
-                q=q,
-                k=k,
-                v=v,
-                o=out,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
-                ssm_state_indices=decode_state_indices,
-                use_qk_l2norm_in_kernel=True,
-                is_kda=True,
-                lower_bound=self._kda_gate_lower_bound,
+            use_flydsl_kda = (
+                os.getenv("ATOM_KDA_USE_FLYDSL", "0") == "1"
+                # The launch geometry and performance crossover are currently
+                # validated on MI308X only. Keep other architectures on the
+                # established Triton path until they have their own tuning.
+                and get_arch() == "gfx942"
+                # Ordinary decode has exactly one packed token per sequence;
+                # reinterpret [1, B, H, D] as FlyDSL's [B, 1, H, D]. MTP is
+                # handled by the separate speculative branch because it needs
+                # per-token state snapshot slots.
+                and gdn_metadata.num_decodes > 0
+                and num_actual_tokens == gdn_metadata.num_decodes
+                # gfx942 uses batch-segmented V splitting and the K16 layout;
+                # the final tuned path is profitable across the tested B1-128.
+                and self.num_local_heads == 8
+                and self.head_dim == 128
+                and ssm_state.dtype == torch.float32
             )
+            if use_flydsl_kda:
+                from aiter.ops.flydsl.linear_attention_kernels import (
+                    flydsl_gdr_decode,
+                )
+
+                decode_batch = gdn_metadata.num_decodes
+                flydsl_gdr_decode(
+                    q.view(decode_batch, 1, self.num_local_heads, self.head_dim),
+                    k.view(decode_batch, 1, self.num_local_heads, self.head_dim),
+                    v.view(decode_batch, 1, self.num_local_heads, self.head_dim),
+                    gate.view(
+                        decode_batch, 1, self.num_local_heads, self.head_dim
+                    ),
+                    beta.view(decode_batch, 1, self.num_local_heads),
+                    self.dt_bias.view(self.num_local_heads, self.head_dim),
+                    self.A_log,
+                    decode_state_indices,
+                    ssm_state,
+                    out.view(
+                        decode_batch, 1, self.num_local_heads, self.head_dim
+                    ),
+                    use_qk_l2norm=True,
+                    need_shuffle_state=False,
+                    is_kda=True,
+                    lower_bound=self._kda_gate_lower_bound,
+                )
+            else:
+                fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=gate,
+                    b=beta,
+                    dt_bias=self.dt_bias,
+                    q=q,
+                    k=k,
+                    v=v,
+                    o=out,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
+                    ssm_state_indices=decode_state_indices,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=True,
+                    lower_bound=self._kda_gate_lower_bound,
+                )
         elif gdn_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
             spec_state_indices = gdn_metadata.spec_state_indices_tensor

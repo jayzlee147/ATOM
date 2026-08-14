@@ -213,6 +213,8 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
     lower_bound: float | None = None,
+    bv_override: int | None = None,
+    num_warps_override: int | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -230,11 +232,30 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK = triton.next_power_of_2(K)
+    # Tune V granularity to available batch parallelism. Small batches need V
+    # splitting to expose enough workgroups; from Kimi TP8 batch 8 onward,
+    # B*HV already supplies at least 64 workgroups and a full-V tile avoids
+    # repeating q/k/gate work across four BV=32 programs. On gfx942 this closes
+    # most of the apparent FlyDSL gap at batch 8-128.
+    is_single_token_kda_decode = is_kda and T == N
+    if is_single_token_kda_decode and N * HV <= 16:
+        bv_cap = 16
+    elif is_single_token_kda_decode and N * HV >= 64:
+        bv_cap = 128
+    else:
+        bv_cap = 32
+    BV = (
+        min(triton.next_power_of_2(V), bv_cap)
+        if bv_override is None
+        else bv_override
+    )
+    if BV not in (16, 32, 64, 128) or V % BV != 0:
+        raise ValueError(f"Unsupported BV={BV} for V={V}")
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 4
+    num_warps = 4 if num_warps_override is None else num_warps_override
 
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
